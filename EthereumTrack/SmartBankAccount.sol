@@ -28,7 +28,7 @@ interface UniswapRouter {
     function WETH() external pure returns(address); //returns the canonical WETH address on the main or testnet
 
     function swapExactETHForTokens(
-        uint256 amountIn,
+        //uint256 amountIn,
         uint256 amountOutMin,
         address[] calldata path, //first element must be the WETH address, last element must be the target token address
         address to,
@@ -42,6 +42,8 @@ interface UniswapRouter {
         address to,
         uint256 deadline
     ) external returns(uint256[] memory amounts);
+
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external returns(uint256[] memory amounts);
 }
 
 contract SmartBankAccount {
@@ -67,8 +69,19 @@ contract SmartBankAccount {
     //Contract functions
     receive() external payable{}
 
-    function addBalance() public payable{
-        _mintToCompound(msg.value);
+    function _mintToCompound(uint256 EthAmount) internal {
+        // Deposit ETH to Compound
+        uint256 cEthContractBeforeMinting = ceth.balanceOf(address(this));
+        // Send ethers to mint
+        ceth.mint{value: EthAmount}();
+
+        uint256 cEthContractAfterMinting = ceth.balanceOf(address(this));
+        // Compute amount that was created by the mint
+        uint256 cEthAmountUser = cEthContractAfterMinting - cEthContractBeforeMinting;
+
+        balances[msg.sender] += cEthAmountUser;
+        depositTimestamps[msg.sender] = block.timestamp;
+        totalContractBalance += cEthAmountUser;
     }
 
     function _approveAmountERC20Tokens(address erc20TokenSmartContractAddress) internal returns(uint256) {
@@ -84,19 +97,8 @@ contract SmartBankAccount {
         return approvedAmountERC20Tokens;
     }
 
-    function _mintToCompound(uint256 EthAmount) internal {
-        // Deposit ETH to Compound
-        uint256 cEthContractBeforeMinting = ceth.balanceOf(address(this));
-        // Send ethers to mint
-        ceth.mint{value: EthAmount}();
-
-        uint256 cEthContractAfterMinting = ceth.balanceOf(address(this));
-        // Compute amount that was created by the mint
-        uint256 cEthAmountUser = cEthContractAfterMinting - cEthContractBeforeMinting;
-
-        balances[msg.sender] += cEthAmountUser;
-        depositTimestamps[msg.sender] = block.timestamp;
-        totalContractBalance += cEthAmountUser;
+    function addBalance() public payable{
+        _mintToCompound(msg.value);
     }
 
     function addBalanceERC20(address erc20TokenSmartContractAddress) public payable {
@@ -126,7 +128,7 @@ contract SmartBankAccount {
     }
 
     function getBalance(address userAddress) public view returns(uint256) {
-        return balances[userAddress] * (ceth.exchangeRateStored() / 1e18);
+        return _convertToETH(balances[userAddress]);
     }
 
     function getCethBalance(address userAddress) public view returns(uint256) {
@@ -137,20 +139,65 @@ contract SmartBankAccount {
         return ceth.exchangeRateStored();
     }
 
+    function _convertToETH(uint256 cEthAmount) internal view returns(uint256) {
+        return cEthAmount * (ceth.exchangeRateStored() / 1e18);
+    }
+
+    function _convertERC20ToEth(uint256 ERC20Amount, address erc20TokenSmartContractAddress) internal returns(uint256) {
+        address[] memory path = new address[](2);
+        path[0] = uniswap.WETH();
+        path[1] = erc20TokenSmartContractAddress;
+
+        uint256 EthAmountToWithdraw = uniswap.getAmountsIn(ERC20Amount, path)[0];
+
+        return EthAmountToWithdraw;
+    }
+
+    function _swapEthForERC20(uint256 EthAmountToWithdraw, address erc20TokenSmartContractAddress) internal {
+        uint256 amountERC20Min = 0;
+        address to = address(msg.sender);
+        address[] memory path = new address[](2);
+        path[0] = uniswap.WETH();
+        path[1] = erc20TokenSmartContractAddress;
+        uint256 deadline = block.timestamp + (24 * 60 * 60);
+
+        uniswap.swapExactETHForTokens{value: EthAmountToWithdraw}(amountERC20Min, path, to, deadline);
+    }
+
+    function _withdrawEthFromCompound(uint256 EthAmountToWithdraw) internal returns(uint256) {
+        uint256 cEthContractBeforeWithdraw = ceth.balanceOf(address(this));
+
+        ceth.redeemUnderlying(EthAmountToWithdraw);
+
+        uint256 cEthContractAfterWithdraw = ceth.balanceOf(address(this));
+        uint256 cEthWithdrawn = cEthContractBeforeWithdraw - cEthContractAfterWithdraw;
+
+        return cEthWithdrawn;
+    }
+
     function withdraw(uint256 EthAmountToWithdraw) public payable {
         require(EthAmountToWithdraw <= getBalance(msg.sender), "You don't have enough balance!");
         address payable transferTo = payable(msg.sender);
-        uint256 cEthAmountToWithdraw = EthAmountToWithdraw / (ceth.exchangeRateStored() / 1e18);
 
-        ceth.redeemUnderlying(EthAmountToWithdraw);
-        totalContractBalance -= cEthAmountToWithdraw;
-        balances[msg.sender] -= cEthAmountToWithdraw;
+        uint256 cEthAmountWithdrawn = _withdrawEthFromCompound(EthAmountToWithdraw);
+
+        totalContractBalance -= cEthAmountWithdrawn;
+        balances[msg.sender] -= cEthAmountWithdrawn;
 
         transferTo.transfer(EthAmountToWithdraw);
     }
 
-    function withdrawERC20(uint256 ERC20AmountToWithdraw) public payable {
+    function withdrawERC20(address erc20TokenSmartContractAddress, uint256 ERC20AmountToWithdraw) public {
+        uint256 EthAmountToWithdraw = _convertERC20ToEth(ERC20AmountToWithdraw, erc20TokenSmartContractAddress);
 
+        require(EthAmountToWithdraw <= getBalance(msg.sender), "You don't have enough balance!");
+
+        uint256 cEthAmountWithdrawn = _withdrawEthFromCompound(EthAmountToWithdraw);
+
+        _swapEthForERC20(EthAmountToWithdraw, erc20TokenSmartContractAddress);
+
+        totalContractBalance -= cEthAmountWithdrawn;
+        balances[msg.sender] -= cEthAmountWithdrawn;
     }
 
     function withdrawAll() public payable {
@@ -159,14 +206,23 @@ contract SmartBankAccount {
         uint256 cEthAmountToWithdraw = balances[msg.sender];
 
         ceth.redeem(cEthAmountToWithdraw);
+
         totalContractBalance -= cEthAmountToWithdraw;
         balances[msg.sender] = 0;
 
         transferTo.transfer(EthAmountToWithdraw);
     }
 
-    function withdrawAllERC20() public payable {
+    function withdrawAllERC20(address erc20TokenSmartContractAddress) public {
+        uint256 EthAmountToWithdraw = getBalance(msg.sender);
+        uint256 cEthAmountToWithdraw = balances[msg.sender];
 
+        ceth.redeem(cEthAmountToWithdraw);
+
+        _swapEthForERC20(EthAmountToWithdraw, erc20TokenSmartContractAddress);
+
+        totalContractBalance -= cEthAmountToWithdraw;
+        balances[msg.sender] = 0;
     }
 
     function addMoneyToContract() public payable {
