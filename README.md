@@ -11,6 +11,7 @@ _(Questbook.app)_
   
   - Launching an NFT
   
+  - dApp - Web App _(JavaScript React and Web3)_ interacting with a smart contract _(solidity)_.
   
   
 - **MyBlockchain** _(coded and tested on PyCharm)_:
